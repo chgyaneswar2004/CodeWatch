@@ -1,11 +1,13 @@
 import os
 import smtplib
 import ssl
+import html
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import List, Optional
 
-from os import environ as env
+from codedog.config.settings import settings
+
 
 
 class EmailNotifier:
@@ -28,12 +30,10 @@ class EmailNotifier:
             smtp_password: SMTP password (defaults to env var SMTP_PASSWORD)
             use_tls: Whether to use TLS for SMTP connection (defaults to True)
         """
-        self.smtp_server = smtp_server or env.get("SMTP_SERVER")
-        self.smtp_port = int(smtp_port or env.get("SMTP_PORT", 587))
-        self.smtp_username = smtp_username or env.get("SMTP_USERNAME")
-        
-        # 优先从系统环境变量获取密码，如果不存在再从 .env 文件获取
-        self.smtp_password = smtp_password or os.environ.get("CODEDOG_SMTP_PASSWORD") or env.get("SMTP_PASSWORD")
+        self.smtp_server = smtp_server or settings.smtp_server
+        self.smtp_port = smtp_port or settings.smtp_port
+        self.smtp_username = smtp_username or settings.smtp_username
+        self.smtp_password = smtp_password or settings.smtp_password
         self.use_tls = use_tls
         
         # Validate required settings
@@ -44,7 +44,7 @@ class EmailNotifier:
             if not self.smtp_username:
                 missing.append("SMTP_USERNAME")
             if not self.smtp_password:
-                missing.append("SMTP_PASSWORD or CODEDOG_SMTP_PASSWORD (environment variable)")
+                missing.append("SMTP_PASSWORD")
             
             raise ValueError(f"Missing required email configuration: {', '.join(missing)}")
     
@@ -86,9 +86,49 @@ class EmailNotifier:
         # Attach markdown content as both plain text and HTML
         text_part = MIMEText(markdown_content, "plain")
         
-        # Basic markdown to HTML conversion
-        # A more sophisticated conversion could be done with a library like markdown2
-        html_content = f"<pre>{markdown_content}</pre>"
+        # Escape markdown content to prevent HTML/script injection
+        escaped_content = html.escape(markdown_content)
+        html_content = f"""
+        <html>
+            <head>
+                <style>
+                    body {{
+                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                        color: #24292f;
+                        background-color: #f6f8fa;
+                        margin: 0;
+                        padding: 20px;
+                    }}
+                    .container {{
+                        max-width: 800px;
+                        margin: 0 auto;
+                        background-color: #ffffff;
+                        padding: 30px;
+                        border-radius: 6px;
+                        border: 1px solid #d0d7de;
+                        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+                    }}
+                    pre {{
+                        white-space: pre-wrap;
+                        word-wrap: break-word;
+                        font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace;
+                        font-size: 13.6px;
+                        line-height: 1.45;
+                        background-color: #f6f8fa;
+                        padding: 16px;
+                        border-radius: 6px;
+                        border: 1px solid #d0d7de;
+                        color: #24292f;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <pre>{escaped_content}</pre>
+                </div>
+            </body>
+        </html>
+        """
         html_part = MIMEText(html_content, "html")
         
         msg.attach(text_part)
@@ -131,7 +171,7 @@ def send_report_email(
         bool: True if email was sent successfully, False otherwise
     """
     # Check if email notification is enabled
-    if not env.get("EMAIL_ENABLED", "").lower() in ("true", "1", "yes"):
+    if not settings.email_enabled:
         print("Email notifications are disabled. Set EMAIL_ENABLED=true to enable.")
         return False
     

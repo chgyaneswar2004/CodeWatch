@@ -4,9 +4,9 @@ from itertools import zip_longest
 from typing import Any, Dict, List
 
 from langchain_core.language_models import BaseLanguageModel
-from langchain.chains import LLMChain
-from langchain.output_parsers import OutputFixingParser, PydanticOutputParser
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import BasePromptTemplate
+from langchain_core.runnables import RunnableLambda
 from pydantic import Field
 
 from codedog.chains.pr_summary.base import PRSummaryChain
@@ -22,7 +22,7 @@ class TranslatePRSummaryChain(PRSummaryChain):
     Note that default review result is usually in English. If language is set to english it will also call llm
     """
 
-    translate_chain: LLMChain = Field(exclude=True)
+    translate_chain: Any = Field(exclude=True)
     """Chain to use to translate summary result."""
 
     @classmethod
@@ -40,11 +40,24 @@ class TranslatePRSummaryChain(PRSummaryChain):
         parser = OutputFixingParser.from_llm(
             llm=pr_summary_llm, parser=PydanticOutputParser(pydantic_object=PRSummary)
         )
-        code_summary_chain = LLMChain(llm=code_summary_llm, prompt=code_summary_prompt)
-        pr_summary_chain = LLMChain(
-            llm=pr_summary_llm, prompt=pr_summary_prompt, output_parser=parser
+        code_summary_chain = (
+            code_summary_prompt
+            | code_summary_llm
+            | StrOutputParser()
+            | RunnableLambda(lambda x: {"text": x})
         )
-        translate_chain = LLMChain(llm=translate_llm, prompt=translate_prompt)
+        pr_summary_chain = (
+            pr_summary_prompt
+            | pr_summary_llm
+            | parser
+            | RunnableLambda(lambda x: {"text": x})
+        )
+        translate_chain = (
+            translate_prompt
+            | translate_llm
+            | StrOutputParser()
+            | RunnableLambda(lambda x: {"text": x})
+        )
 
         return cls(
             language=language,
@@ -88,7 +101,7 @@ class TranslatePRSummaryChain(PRSummaryChain):
         }
 
     def _translate_summary(self, summary: PRSummary) -> PRSummary:
-        response = self.translate_chain(
+        response = self.translate_chain.invoke(
             {"language": self.language, "description": "", "content": summary.overview}
         )
         summary.overview = response["text"]
@@ -107,7 +120,7 @@ class TranslatePRSummaryChain(PRSummaryChain):
             for cs in code_summaries
             if cs.summary != ""
         ]
-        response = self.translate_chain.apply(data) if data else []
+        response = self.translate_chain.batch(data) if data else []
 
         for cs, r in zip_longest(code_summaries, response):
             if not cs or not r:
@@ -141,7 +154,7 @@ class TranslatePRSummaryChain(PRSummaryChain):
             for cs in code_summaries
             if cs.summary != ""
         ]
-        response = await self.translate_chain.aapply(data) if data else []
+        response = await self.translate_chain.abatch(data) if data else []
 
         for cs, r in zip_longest(code_summaries, response):
             if not cs or not r:

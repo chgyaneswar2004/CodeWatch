@@ -77,14 +77,14 @@ class GitlabRetriever(Retriever):
     def changed_files(self) -> list[ChangeFile]:
         return self._merge_request.change_files
 
-    def get_blob(self, blob_sha: str or id) -> Blob:
+    def get_blob(self, blob_sha: str) -> Blob:
         git_blob = self._git_repository.repository_blob(blob_sha)
         if isinstance(git_blob, dict):
             return self._build_blob(git_blob)
         else:
             raise ValueError(f"Blob not found. {git_blob}")
 
-    def get_commit(self, commit_sha: str or id) -> Commit:
+    def get_commit(self, commit_sha: str) -> Commit:
         git_commit = self._git_repository.commits.get(commit_sha)
         if isinstance(git_commit, ProjectCommit):
             return self._build_commit(git_commit)
@@ -165,10 +165,10 @@ class GitlabRetriever(Retriever):
     def _build_change_file_list(self, git_mr: ProjectMergeRequest) -> list[ChangeFile]:
         change_files = []
 
-        # list all diffs
-        diffs_list = git_mr.diffs.list(per_page=self.LIST_DIFF_LIMIT)
+        # Use python-gitlab's lazy iterator to dynamically fetch all pages of diffs
+        diffs_iterator = git_mr.diffs.list(iterator=True, per_page=100)
 
-        for diff_response in diffs_list:
+        for diff_response in diffs_iterator:
             full_diff = git_mr.diffs.get(diff_response.id)
             for diff in full_diff.attributes.get("diffs", []):
                 change_file = self._build_change_file(diff, git_mr)

@@ -1,10 +1,13 @@
 import json
 import re
-from typing import Dict, List, Tuple, Any
+import logging
+from typing import Dict, List, Tuple, Any, Optional
 
 from codedog.actors.reporters.base import Reporter
 from codedog.localization import Localization
 from codedog.models.code_review import CodeReview
+
+logger = logging.getLogger(__name__)
 
 
 class CodeReviewMarkdownReporter(Reporter, Localization):
@@ -21,29 +24,14 @@ class CodeReviewMarkdownReporter(Reporter, Localization):
 
         return self._markdown
 
-    def _extract_scores(self, review_text: str, file_name: str) -> Dict[str, Any]:
+    def _extract_scores(self, review_text: str, file_name: str) -> Optional[Dict[str, Any]]:
         """Extract scores from the review text using a simple format."""
-        # Default empty score data
-        default_scores = {
-            "file": file_name,
-            "scores": {
-                "readability": 0,
-                "efficiency": 0,
-                "security": 0,
-                "structure": 0,
-                "error_handling": 0,
-                "documentation": 0,
-                "code_style": 0,
-                "overall": 0
-            }
-        }
-
         try:
             # Look for the scores section
             scores_section = re.search(r'#{1,3}\s*(?:SCORES|评分):\s*([\s\S]*?)(?=#{1,3}|$)', review_text)
             if not scores_section:
-                print(f"No scores section found for {file_name}")
-                return default_scores
+                logger.debug(f"No scores section found for {file_name}")
+                return None
 
             scores_text = scores_section.group(1)
 
@@ -66,7 +54,7 @@ class CodeReviewMarkdownReporter(Reporter, Localization):
                     if match:
                         overall = float(match.group(1))
                 except Exception as e:
-                    print(f"Error extracting overall score with alternative pattern: {e}")
+                    logger.warning(f"Error extracting overall score with alternative pattern for {file_name}: {e}")
 
             # Update scores if found
             if any([readability, efficiency, security, structure, error_handling, documentation, code_style, overall]):
@@ -83,13 +71,13 @@ class CodeReviewMarkdownReporter(Reporter, Localization):
                         "overall": overall or 0
                     }
                 }
-                print(f"Extracted scores for {file_name}: {scores['scores']}")
+                logger.info(f"Extracted scores for {file_name}: {scores['scores']}")
                 return scores
 
         except Exception as e:
-            print(f"Error extracting scores from review for {file_name}: {e}")
+            logger.error(f"Error extracting scores from review for {file_name}: {e}")
 
-        return default_scores
+        return None
 
     def _extract_score(self, text: str, dimension: str) -> float:
         """Extract a score for a specific dimension from text."""
@@ -99,15 +87,15 @@ class CodeReviewMarkdownReporter(Reporter, Localization):
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 score = float(match.group(1))
-                print(f"Found {dimension} score: {score}")
+                logger.debug(f"Found {dimension} score: {score}")
                 return score
             else:
-                print(f"No match found for {dimension} using pattern: {pattern}")
+                logger.debug(f"No match found for {dimension} using pattern: {pattern}")
                 # Print a small excerpt of the text for debugging
                 excerpt = text[:200] + "..." if len(text) > 200 else text
-                print(f"Text excerpt: {excerpt}")
+                logger.debug(f"Text excerpt: {excerpt}")
         except Exception as e:
-            print(f"Error extracting {dimension} score: {e}")
+            logger.error(f"Error extracting {dimension} score: {e}")
         return 0
 
     def _calculate_average_scores(self) -> Dict:
@@ -156,9 +144,9 @@ class CodeReviewMarkdownReporter(Reporter, Localization):
         if not self._scores:
             return ""
 
-        print(f"Generating summary table with {len(self._scores)} files")
+        logger.info(f"Generating summary table with {len(self._scores)} files")
         for i, score in enumerate(self._scores):
-            print(f"File {i+1}: {score['file']} - Scores: {score['scores']}")
+            logger.debug(f"File {i+1}: {score['file']} - Scores: {score['scores']}")
 
         file_score_rows = []
         for score in self._scores:
@@ -187,16 +175,17 @@ class CodeReviewMarkdownReporter(Reporter, Localization):
 
     def _generate_report(self):
         code_review_segs = []
-        print(f"Processing {len(self._code_reviews)} code reviews")
+        logger.info(f"Processing {len(self._code_reviews)} code reviews")
 
         for i, code_review in enumerate(self._code_reviews):
             # Extract scores if the review is not empty
             if hasattr(code_review, 'review') and code_review.review.strip():
                 file_name = code_review.file.full_name if hasattr(code_review, 'file') and hasattr(code_review.file, 'full_name') else "Unknown"
-                print(f"\nExtracting scores for review {i+1}: {file_name}")
+                logger.info(f"Extracting scores for review {i+1}: {file_name}")
                 score_data = self._extract_scores(code_review.review, file_name)
-                print(f"Extracted score data: {score_data}")
-                self._scores.append(score_data)
+                logger.debug(f"Extracted score data: {score_data}")
+                if score_data:
+                    self._scores.append(score_data)
 
             # Add the review text (without modification)
             code_review_segs.append(

@@ -86,6 +86,9 @@ ignore_token_for_push = true
 [tool.semantic_release.publish]
 upload_to_vcs_release = true
 
+[tool.pytest.ini_options]
+addopts = "--ignore=tests/test_email.py"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

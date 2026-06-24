@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from itertools import zip_longest
-from typing import List
+from typing import Any, List
 
 from langchain_core.language_models import BaseLanguageModel
-from langchain.chains import LLMChain
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import BasePromptTemplate
+from langchain_core.runnables import RunnableLambda
 from pydantic import Field
 
 from codedog.chains.code_review.base import CodeReviewChain
@@ -23,7 +24,7 @@ class TranslateCodeReviewChain(CodeReviewChain):
 
     Note that default review result is usually in English. If language is set to english it will also call llm
     """
-    translate_chain: LLMChain = Field(exclude=True)
+    translate_chain: Any = Field(exclude=True)
     """Chain to use to translate code review result."""
 
     @classmethod
@@ -37,12 +38,12 @@ class TranslateCodeReviewChain(CodeReviewChain):
         translate_prompt: BasePromptTemplate = TRANSLATE_PROMPT,
         **kwargs,
     ) -> CodeReviewChain:
+        chain = prompt | llm | StrOutputParser() | RunnableLambda(lambda x: {"text": x})
+        translate_chain = translate_prompt | translate_llm | StrOutputParser() | RunnableLambda(lambda x: {"text": x})
         return cls(
             language=language,
-            chain=LLMChain(llm=llm, prompt=prompt, **kwargs),
-            translate_chain=LLMChain(
-                llm=translate_llm, prompt=translate_prompt, **kwargs
-            ),
+            chain=chain,
+            translate_chain=translate_chain,
             processor=PullRequestProcessor(),
         )
 
@@ -74,7 +75,7 @@ class TranslateCodeReviewChain(CodeReviewChain):
             for cr in code_reviews
             if cr.review != ""
         ]
-        response = self.translate_chain.apply(data) if data else []
+        response = self.translate_chain.batch(data) if data else []
 
         for cr, r in zip_longest(code_reviews, response):
             if not cr or not r:
@@ -93,7 +94,7 @@ class TranslateCodeReviewChain(CodeReviewChain):
             for cr in code_reviews
             if cr.review != ""
         ]
-        response = await self.translate_chain.aapply(data) if data else []
+        response = await self.translate_chain.abatch(data) if data else []
 
         for cr, r in zip_longest(code_reviews, response):
             if not cr or not r:

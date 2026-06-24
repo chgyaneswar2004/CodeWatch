@@ -3,6 +3,7 @@ from os import environ as env
 from typing import Dict, Any, List, Optional
 import inspect
 import os
+import time
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai.chat_models import AzureChatOpenAI, ChatOpenAI
@@ -58,10 +59,72 @@ class DeepSeekChatModel(BaseChatModel):
     total_cost: float = 0.0
     failed_requests: int = 0  # 失败请求计数
 
-    def _calculate_cost(self, total_tokens: int) -> float:
-        """Calculate cost based on token usage."""
-        # DeepSeek pricing (as of 2024)
-        return total_tokens * 0.0001  # $0.0001 per token
+    def _calculate_cost(self, prompt_tokens: int, completion_tokens: int) -> float:
+        """Calculate cost based on token usage and model type."""
+        model_lower = self.model_name.lower() if self.model_name else ""
+        # DeepSeek-R1 pricing: Input: $0.55/M, Output: $2.19/M
+        # DeepSeek-V3 pricing: Input: $0.14/M, Output: $0.28/M
+        if "r1" in model_lower or "reason" in model_lower:
+            input_rate = 0.55 / 1_000_000
+            output_rate = 2.19 / 1_000_000
+        else:
+            input_rate = 0.14 / 1_000_000
+            output_rate = 0.28 / 1_000_000
+            
+        return (prompt_tokens * input_rate) + (completion_tokens * output_rate)
+
+    def _normalize_messages(self, messages: List[BaseMessage]) -> List[Dict[str, str]]:
+        """Format LangChain messages to conform to DeepSeek API constraints."""
+        if not messages:
+            return []
+
+        # 1. Convert to dicts with roles and filter/merge system messages
+        system_contents = []
+        other_messages = []
+        for message in messages:
+            role = "user" if isinstance(message, HumanMessage) else "system" if isinstance(message, SystemMessage) else "assistant"
+            content = message.content
+            if isinstance(content, list):
+                # Handle cases where message content is a list of blocks
+                content_str = "\n".join([str(block) for block in content])
+            else:
+                content_str = str(content)
+            
+            content_str = content_str.strip()
+            if not content_str:
+                content_str = "..."
+
+            if role == "system":
+                system_contents.append(content_str)
+            else:
+                other_messages.append({"role": role, "content": content_str})
+
+        # 2. Merge consecutive messages of the same role
+        merged_others = []
+        for msg in other_messages:
+            if not merged_others:
+                merged_others.append(msg)
+            else:
+                last_msg = merged_others[-1]
+                if last_msg["role"] == msg["role"]:
+                    last_msg["content"] = (last_msg["content"] + "\n\n" + msg["content"]).strip()
+                else:
+                    merged_others.append(msg)
+
+        # 3. Ensure the sequence starts with user (if there are any other messages)
+        if merged_others and merged_others[0]["role"] == "assistant":
+            merged_others.insert(0, {"role": "user", "content": "Please process the following:"})
+
+        # 4. Construct final message list
+        final_messages = []
+        if system_contents:
+            final_messages.append({
+                "role": "system",
+                "content": "\n\n".join(system_contents).strip()
+            })
+        final_messages.extend(merged_others)
+        
+        return final_messages
 
     @property
     def _llm_type(self) -> str:
@@ -76,26 +139,27 @@ class DeepSeekChatModel(BaseChatModel):
     ) -> ChatResult:
         """Generate a response from the DeepSeek API."""
         try:
-            # Convert LangChain messages to DeepSeek format
-            deepseek_messages = []
-            for message in messages:
-                role = "user" if isinstance(message, HumanMessage) else "system" if isinstance(message, SystemMessage) else "assistant"
-                deepseek_messages.append({"role": role, "content": message.content})
+            # Convert LangChain messages to DeepSeek format with normalization
+            deepseek_messages = self._normalize_messages(messages)
 
             # Prepare API request
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             }
+            
+            is_reasoner = "r1" in self.model_name.lower() or "reason" in self.model_name.lower() or self._llm_type == "deepseek-reasoner"
+            
             payload = {
                 "model": self.model_name,
                 "messages": deepseek_messages,
-                "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
-                "top_p": self.top_p,
             }
-            if stop:
-                payload["stop"] = stop
+            if not is_reasoner:
+                payload["temperature"] = self.temperature
+                payload["top_p"] = self.top_p
+                if stop:
+                    payload["stop"] = stop
 
             # Log request details for debugging
             logger.debug(f"DeepSeek API request to {self.api_base}")
@@ -106,47 +170,95 @@ class DeepSeekChatModel(BaseChatModel):
             api_base = self.api_base.rstrip('/')
             endpoint = f"{api_base}/v1/chat/completions"
 
-            # Make API request with timeout
-            try:
-                response = requests.post(endpoint, headers=headers, json=payload, timeout=self.timeout)
-                response_text = response.text
-            except requests.exceptions.Timeout as e:
-                log_error(e, f"DeepSeek API request timed out after {self.timeout} seconds")
-                raise
+            # Implement retry mechanism
+            retries = 0
+            last_error = None
 
-            try:
-                response.raise_for_status()
-            except requests.exceptions.HTTPError as e:
-                log_error(e, f"DeepSeek API HTTP error (status {response.status_code})", response_text)
-                raise
+            while retries < self.max_retries:
+                try:
+                    # Calculate current timeout using exponential backoff
+                    current_timeout = self.timeout * (1 + 0.5 * retries)
+                    logger.info(f"DeepSeek API request attempt {retries+1}/{self.max_retries} with timeout {current_timeout}s")
 
-            try:
-                response_data = response.json()
-            except json.JSONDecodeError as e:
-                log_error(e, "Failed to decode JSON response", response_text)
-                raise
+                    response = requests.post(endpoint, headers=headers, json=payload, timeout=current_timeout)
+                    response_text = response.text
 
-            # Extract response content
-            if not response_data.get("choices"):
-                error_msg = "No choices in response"
-                log_error(ValueError(error_msg), "DeepSeek API response error", json.dumps(response_data, ensure_ascii=False))
-                raise ValueError(error_msg)
+                    if response.status_code != 200:
+                        error_msg = f"DeepSeek API HTTP error (status {response.status_code}): {response_text}"
+                        logger.warning(error_msg)
+                        last_error = requests.exceptions.HTTPError(error_msg, response=response)
+                        if response.status_code >= 500:
+                            retries += 1
+                            if retries < self.max_retries:
+                                wait_time = self.retry_delay * (2 ** retries)
+                                logger.info(f"Server error, retrying in {wait_time}s...")
+                                time.sleep(wait_time)
+                                continue
+                        raise last_error
 
-            message = response_data["choices"][0]["message"]["content"]
+                    try:
+                        response_data = response.json()
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to decode JSON response: {e}\nResponse: {response_text}")
+                        last_error = e
+                        retries += 1
+                        if retries < self.max_retries:
+                            wait_time = self.retry_delay * (2 ** retries)
+                            logger.info(f"JSON decode error, retrying in {wait_time}s...")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            raise last_error
 
-            # Update token usage and cost
-            if "usage" in response_data:
-                tokens = response_data["usage"].get("total_tokens", 0)
-                self.total_tokens += tokens
-                self.total_cost += self._calculate_cost(tokens)
+                    if not response_data.get("choices"):
+                        error_msg = f"No choices in response: {json.dumps(response_data, ensure_ascii=False)}"
+                        logger.warning(error_msg)
+                        last_error = ValueError(error_msg)
+                        retries += 1
+                        if retries < self.max_retries:
+                            wait_time = self.retry_delay * (2 ** retries)
+                            logger.info(f"Invalid response format, retrying in {wait_time}s...")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            raise last_error
 
-            # Create and return ChatResult
-            generation = ChatGeneration(message=AIMessage(content=message))
-            return ChatResult(generations=[generation])
+                    message = response_data["choices"][0]["message"]["content"]
+
+                    logger.info("DeepSeek API response received successfully")
+                    logger.debug(f"DeepSeek API complete response: {json.dumps(response_data, ensure_ascii=False)}")
+                    logger.debug(f"DeepSeek API message content: {message}")
+
+                    # Update token usage and cost
+                    if "usage" in response_data:
+                        prompt_tokens = response_data["usage"].get("prompt_tokens", 0)
+                        completion_tokens = response_data["usage"].get("completion_tokens", 0)
+                        self.total_tokens += prompt_tokens + completion_tokens
+                        self.total_cost += self._calculate_cost(prompt_tokens, completion_tokens)
+                        logger.info(f"DeepSeek API token usage: {prompt_tokens + completion_tokens}, total cost: ${self.total_cost:.6f}")
+
+                    # Create and return ChatResult
+                    generation = ChatGeneration(message=AIMessage(content=message))
+                    return ChatResult(generations=[generation])
+
+                except (requests.exceptions.RequestException, ConnectionError, ValueError) as e:
+                    last_error = e
+                    logger.warning(f"Error during DeepSeek API request: {str(e)}")
+                    retries += 1
+                    self.failed_requests += 1
+
+                    if retries < self.max_retries:
+                        wait_time = self.retry_delay * (2 ** retries)
+                        logger.info(f"Request error, retrying in {wait_time}s... (attempt {retries}/{self.max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"Failed after {self.max_retries} attempts: {str(last_error)}")
+                        error_message = f"Error calling DeepSeek API after {self.max_retries} attempts: {str(last_error)}"
+                        generation = ChatGeneration(message=AIMessage(content=error_message))
+                        return ChatResult(generations=[generation])
 
         except Exception as e:
             log_error(e, "DeepSeek API error")
-            # Return a default message indicating the error
             message = f"Error calling DeepSeek API: {str(e)}"
             generation = ChatGeneration(message=AIMessage(content=message))
             return ChatResult(generations=[generation])
@@ -160,26 +272,27 @@ class DeepSeekChatModel(BaseChatModel):
     ) -> ChatResult:
         """Asynchronously generate a response from the DeepSeek API."""
         try:
-            # Convert LangChain messages to DeepSeek format
-            deepseek_messages = []
-            for message in messages:
-                role = "user" if isinstance(message, HumanMessage) else "system" if isinstance(message, SystemMessage) else "assistant"
-                deepseek_messages.append({"role": role, "content": message.content})
+            # Convert LangChain messages to DeepSeek format with normalization
+            deepseek_messages = self._normalize_messages(messages)
 
             # Prepare API request
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             }
+            
+            is_reasoner = "r1" in self.model_name.lower() or "reason" in self.model_name.lower() or self._llm_type == "deepseek-reasoner"
+            
             payload = {
                 "model": self.model_name,
                 "messages": deepseek_messages,
-                "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
-                "top_p": self.top_p,
             }
-            if stop:
-                payload["stop"] = stop
+            if not is_reasoner:
+                payload["temperature"] = self.temperature
+                payload["top_p"] = self.top_p
+                if stop:
+                    payload["stop"] = stop
 
             # Log request details for debugging
             logger.debug(f"DeepSeek API request to {self.api_base}")
@@ -260,7 +373,6 @@ class DeepSeekChatModel(BaseChatModel):
                                 else:
                                     raise last_error
 
-                            # 提取消息内容
                             message = response_data["choices"][0]["message"]["content"]
 
                             # 记录完整的响应内容用于调试
@@ -268,12 +380,13 @@ class DeepSeekChatModel(BaseChatModel):
                             logger.debug(f"DeepSeek API complete response: {json.dumps(response_data, ensure_ascii=False)}")
                             logger.debug(f"DeepSeek API message content: {message}")
 
-                            # 更新令牌使用和成本
+                            # 更新令牌使用 and 成本
                             if "usage" in response_data:
-                                tokens = response_data["usage"].get("total_tokens", 0)
-                                self.total_tokens += tokens
-                                self.total_cost += self._calculate_cost(tokens)
-                                logger.info(f"DeepSeek API token usage: {tokens}, total cost: ${self.total_cost:.6f}")
+                                prompt_tokens = response_data["usage"].get("prompt_tokens", 0)
+                                completion_tokens = response_data["usage"].get("completion_tokens", 0)
+                                self.total_tokens += prompt_tokens + completion_tokens
+                                self.total_cost += self._calculate_cost(prompt_tokens, completion_tokens)
+                                logger.info(f"DeepSeek API token usage: {prompt_tokens + completion_tokens}, total cost: ${self.total_cost:.6f}")
 
                             # 创建并返回 ChatResult
                             generation = ChatGeneration(message=AIMessage(content=message))
@@ -315,20 +428,21 @@ class DeepSeekR1Model(DeepSeekChatModel):
         return "deepseek-reasoner"
 
 
+from codedog.config.settings import settings
+
+
 @lru_cache(maxsize=1)
 def load_gpt_llm() -> BaseChatModel:
     """Load GPT 3.5 Model"""
-    # Get the specific GPT-3.5 model name from environment variable or use default
-    gpt35_model = env.get("GPT35_MODEL", "gpt-3.5-turbo")
+    gpt35_model = settings.gpt35_model
 
-    if env.get("AZURE_OPENAI"):
-        # For Azure, use the deployment ID from environment
-        deployment_id = env.get("AZURE_OPENAI_DEPLOYMENT_ID", "gpt-35-turbo")
+    if settings.azure_openai:
+        deployment_id = settings.azure_openai_deployment_id
 
         llm = AzureChatOpenAI(
             openai_api_type="azure",
-            api_key=env.get("AZURE_OPENAI_API_KEY", ""),
-            azure_endpoint=env.get("AZURE_OPENAI_API_BASE", ""),
+            api_key=settings.azure_openai_api_key,
+            azure_endpoint=settings.azure_openai_api_base,
             api_version="2024-05-01-preview",
             azure_deployment=deployment_id,
             model=gpt35_model,
@@ -336,7 +450,7 @@ def load_gpt_llm() -> BaseChatModel:
         )
     else:
         llm = ChatOpenAI(
-            api_key=env.get("OPENAI_API_KEY"),
+            api_key=settings.openai_api_key,
             model=gpt35_model,
             temperature=0,
         )
@@ -346,17 +460,15 @@ def load_gpt_llm() -> BaseChatModel:
 @lru_cache(maxsize=1)
 def load_gpt4_llm():
     """Load GPT 4 Model. Make sure your key have access to GPT 4 API. call this function won't check it."""
-    # Get the specific GPT-4 model name from environment variable or use default
-    gpt4_model = env.get("GPT4_MODEL", "gpt-4")
+    gpt4_model = settings.gpt4_model
 
-    if env.get("AZURE_OPENAI"):
-        # For Azure, use the GPT-4 deployment ID if available
-        deployment_id = env.get("AZURE_OPENAI_GPT4_DEPLOYMENT_ID", env.get("AZURE_OPENAI_DEPLOYMENT_ID", "gpt-4"))
+    if settings.azure_openai:
+        deployment_id = settings.azure_openai_gpt4_deployment_id or settings.azure_openai_deployment_id
 
         llm = AzureChatOpenAI(
             openai_api_type="azure",
-            api_key=env.get("AZURE_OPENAI_API_KEY", ""),
-            azure_endpoint=env.get("AZURE_OPENAI_API_BASE", ""),
+            api_key=settings.azure_openai_api_key,
+            azure_endpoint=settings.azure_openai_api_base,
             api_version="2024-05-01-preview",
             azure_deployment=deployment_id,
             model=gpt4_model,
@@ -364,7 +476,7 @@ def load_gpt4_llm():
         )
     else:
         llm = ChatOpenAI(
-            api_key=env.get("OPENAI_API_KEY"),
+            api_key=settings.openai_api_key,
             model=gpt4_model,
             temperature=0,
         )
@@ -374,17 +486,15 @@ def load_gpt4_llm():
 @lru_cache(maxsize=1)
 def load_gpt4o_llm():
     """Load GPT-4o Model. Make sure your key have access to GPT-4o API."""
-    # Get the specific GPT-4o model name from environment variable or use default
-    gpt4o_model = env.get("GPT4O_MODEL", "gpt-4o")
+    gpt4o_model = settings.gpt4o_model
 
-    if env.get("AZURE_OPENAI"):
-        # For Azure, use the GPT-4o deployment ID if available
-        deployment_id = env.get("AZURE_OPENAI_GPT4O_DEPLOYMENT_ID", env.get("AZURE_OPENAI_DEPLOYMENT_ID", "gpt-4o"))
+    if settings.azure_openai:
+        deployment_id = settings.azure_openai_gpt4o_deployment_id or settings.azure_openai_deployment_id
 
         llm = AzureChatOpenAI(
             openai_api_type="azure",
-            api_key=env.get("AZURE_OPENAI_API_KEY", ""),
-            azure_endpoint=env.get("AZURE_OPENAI_API_BASE", ""),
+            api_key=settings.azure_openai_api_key,
+            azure_endpoint=settings.azure_openai_api_base,
             api_version="2024-05-01-preview",
             azure_deployment=deployment_id,
             model=gpt4o_model,
@@ -392,7 +502,7 @@ def load_gpt4o_llm():
         )
     else:
         llm = ChatOpenAI(
-            api_key=env.get("OPENAI_API_KEY"),
+            api_key=settings.openai_api_key,
             model=gpt4o_model,
             temperature=0,
         )
@@ -403,15 +513,15 @@ def load_gpt4o_llm():
 def load_deepseek_llm():
     """Load DeepSeek model"""
     llm = DeepSeekChatModel(
-        api_key=env.get("DEEPSEEK_API_KEY"),
-        model_name=env.get("DEEPSEEK_MODEL"),
-        api_base=env.get("DEEPSEEK_API_BASE"),
-        temperature=float(env.get("DEEPSEEK_TEMPERATURE", "0")),
-        max_tokens=int(env.get("DEEPSEEK_MAX_TOKENS", "4096")),
-        top_p=float(env.get("DEEPSEEK_TOP_P", "0.95")),
-        timeout=int(env.get("DEEPSEEK_TIMEOUT", "600")),  # 默认超时时间增加到10分钟
-        max_retries=int(env.get("DEEPSEEK_MAX_RETRIES", "3")),  # 最大重试次数
-        retry_delay=int(env.get("DEEPSEEK_RETRY_DELAY", "5")),  # 重试间隔（秒）
+        api_key=settings.deepseek_api_key or "",
+        model_name=settings.deepseek_model or "deepseek-chat",
+        api_base=settings.deepseek_api_base or "https://api.deepseek.com",
+        temperature=settings.deepseek_temperature,
+        max_tokens=settings.deepseek_max_tokens,
+        top_p=settings.deepseek_top_p,
+        timeout=settings.deepseek_timeout,
+        max_retries=settings.deepseek_max_retries,
+        retry_delay=settings.deepseek_retry_delay,
     )
     return llm
 
@@ -420,17 +530,18 @@ def load_deepseek_llm():
 def load_deepseek_r1_llm():
     """Load DeepSeek R1 model"""
     llm = DeepSeekR1Model(
-        api_key=env.get("DEEPSEEK_API_KEY"),
-        model_name=env.get("DEEPSEEK_R1_MODEL"),
-        api_base=env.get("DEEPSEEK_R1_API_BASE", env.get("DEEPSEEK_API_BASE")),
-        temperature=float(env.get("DEEPSEEK_TEMPERATURE", "0")),
-        max_tokens=int(env.get("DEEPSEEK_MAX_TOKENS", "4096")),
-        top_p=float(env.get("DEEPSEEK_TOP_P", "0.95")),
-        timeout=int(env.get("DEEPSEEK_TIMEOUT", "600")),  # 默认超时时间增加到10分钟
-        max_retries=int(env.get("DEEPSEEK_MAX_RETRIES", "3")),  # 最大重试次数
-        retry_delay=int(env.get("DEEPSEEK_RETRY_DELAY", "5")),  # 重试间隔（秒）
+        api_key=settings.deepseek_api_key or "",
+        model_name=settings.deepseek_r1_model or "deepseek-reasoner",
+        api_base=settings.deepseek_r1_api_base or settings.deepseek_api_base or "https://api.deepseek.com",
+        temperature=settings.deepseek_temperature,
+        max_tokens=settings.deepseek_max_tokens,
+        top_p=settings.deepseek_top_p,
+        timeout=settings.deepseek_timeout,
+        max_retries=settings.deepseek_max_retries,
+        retry_delay=settings.deepseek_retry_delay,
     )
     return llm
+
 
 
 def load_model_by_name(model_name: str) -> BaseChatModel:

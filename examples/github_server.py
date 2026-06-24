@@ -36,10 +36,10 @@ app = FastAPI()
 
 
 class GithubEvent(BaseModel):
-    action: str
-    number: int
-    pull_request: dict
-    repository: dict
+    action: str | None = None
+    number: int | None = None
+    pull_request: dict | None = None
+    repository: dict | None = None
 
 
 @app.post("/github")
@@ -78,8 +78,8 @@ async def github(request: Request, event: GithubEvent, x_hub_signature_256: str 
 async def handle_github_event(event: GithubEvent, **kwargs) -> str:
     _github_event_filter(event)
 
-    repository_id: int = event.repository.get("id", 0)
-    pull_request_number: int = event.number
+    repository_id: int = event.repository.get("id", 0) if event.repository else 0
+    pull_request_number: int = event.number or 0
 
     logging.info(
         f"Retrieve pull request from Github {repository_id} {pull_request_number}"
@@ -164,8 +164,8 @@ def _github_event_filter(event: GithubEvent):
 
     if not pull_request:
         raise RuntimeError("Not a pull request event.")
-    if event.action not in ("opened"):
-        raise RuntimeError("Not a pull request open event.")
+    if event.action not in ("opened", "reopened", "synchronize"):
+        raise RuntimeError("Not a supported pull request event action.")
     if pull_request.get("state", "") != "open":
         raise RuntimeError("Pull request status is not open.")
     if pull_request.get("draft", False):
@@ -173,6 +173,8 @@ def _github_event_filter(event: GithubEvent):
 
 
 def start():
+    token_str = github_token[:10] + "..." if github_token else "None"
+    logging.info(f"Loaded GITHUB_TOKEN: {token_str}")
     uvicorn.run("examples.github_server:app", host=host, port=port, workers=worker_num)
     logging.info(f"Codedog v{VERSION}: server start.")
 

@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # Load environmental variables from .env file if present
-load_dotenv()
+load_dotenv(override=True)
 
 class Settings(BaseModel):
     # Git configurations

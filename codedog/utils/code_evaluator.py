@@ -2886,18 +2886,89 @@ Please provide a brief summary of the overall changes and their impact.
 If estimated working hours are provided, please comment on whether this estimate seems reasonable given the scope of changes."""
 
 
-def generate_evaluation_markdown(evaluation_results: List[FileEvaluationResult]) -> str:
+def generate_commit_report_markdown(review_results: Dict[str, Any]) -> str:
+    """Generate Markdown report for a single commit review."""
+    commit_hash = review_results.get("commit_hash", "Unknown")
+    stats = review_results.get("statistics", {})
+    whole_eval = review_results.get("whole_commit_evaluation", {})
+    files = review_results.get("files", [])
+
+    markdown = f"# CodeDog Commit Review Report - {commit_hash[:8]}\n\n"
+
+    markdown += "## Overview\n\n"
+    markdown += f"- **Commit Hash**: {commit_hash}\n"
+    markdown += f"- **Files Evaluated**: {stats.get('total_files', 0)}\n"
+    markdown += f"- **Total Additions**: {stats.get('total_additions', 0)} lines\n"
+    markdown += f"- **Total Deletions**: {stats.get('total_deletions', 0)} lines\n"
+
+    est_hours = review_results.get("estimated_hours", 0)
+    if est_hours > 0:
+        markdown += f"- **Estimated Working Hours**: {est_hours:.1f} hours\n"
+
+    markdown += "\n"
+
+    # Overall score table
+    markdown += "## Overall Scores\n\n"
+    markdown += "| Dimension | Score |\n"
+    markdown += "|-----------|-------|\n"
+    markdown += f"| Readability | {whole_eval.get('readability', 5)} |\n"
+    markdown += f"| Efficiency & Performance | {whole_eval.get('efficiency', 5)} |\n"
+    markdown += f"| Security | {whole_eval.get('security', 5)} |\n"
+    markdown += f"| Structure & Design | {whole_eval.get('structure', 5)} |\n"
+    markdown += f"| Error Handling | {whole_eval.get('error_handling', 5)} |\n"
+    markdown += f"| Documentation & Comments | {whole_eval.get('documentation', 5)} |\n"
+    markdown += f"| Code Style | {whole_eval.get('code_style', 5)} |\n"
+
+    overall_score = whole_eval.get('overall_score', 5.0)
+    if isinstance(overall_score, (int, float)):
+        markdown += f"| **Overall Score** | **{overall_score:.1f}** |\n"
+    else:
+        markdown += f"| **Overall Score** | **{overall_score}** |\n"
+
+    markdown += "\n"
+
+    # Overall summary comments
+    markdown += "## Overall Summary & Impact\n\n"
+    markdown += f"{review_results.get('summary', 'No summary available.')}\n\n"
+
+    # Detail comments
+    markdown += "## File Evaluation Details\n\n"
+    for idx, file in enumerate(files, 1):
+        markdown += f"### {idx}. {file.get('path', 'Unknown')}\n\n"
+        markdown += f"- **Status**: {file.get('status', 'M')}\n"
+        markdown += f"- **Overall Score**: {file.get('overall_score', 5.0)}\n"
+        markdown += f"- **Scores**:\n\n"
+        markdown += "| Dimension | Score |\n"
+        markdown += "|-----------|-------|\n"
+        markdown += f"| Readability | {file.get('readability', 5)} |\n"
+        markdown += f"| Efficiency | {file.get('efficiency', 5)} |\n"
+        markdown += f"| Security | {file.get('security', 5)} |\n"
+        markdown += f"| Structure | {file.get('structure', 5)} |\n"
+        markdown += f"| Error Handling | {file.get('error_handling', 5)} |\n"
+        markdown += f"| Documentation | {file.get('documentation', 5)} |\n"
+        markdown += f"| Code Style | {file.get('code_style', 5)} |\n\n"
+        markdown += "**Comments**:\n\n"
+        markdown += f"{file.get('comments', 'No comments available.')}\n\n"
+        markdown += "---\n\n"
+
+    return markdown
+
+
+def generate_evaluation_markdown(evaluation_results) -> str:
     """
     生成评价结果的Markdown表格
 
     Args:
-        evaluation_results: 文件评价结果列表
+        evaluation_results: 文件评价结果列表(List[FileEvaluationResult]) 或 单个提交的评价结果字典(Dict[str, Any])
 
     Returns:
         str: Markdown格式的评价表格
     """
     if not evaluation_results:
         return "## 代码评价结果\n\n没有找到需要评价的代码提交。"
+
+    if isinstance(evaluation_results, dict):
+        return generate_commit_report_markdown(evaluation_results)
 
     # 按日期排序结果
     sorted_results = sorted(evaluation_results, key=lambda x: x.date)

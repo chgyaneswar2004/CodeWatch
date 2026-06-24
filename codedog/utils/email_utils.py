@@ -138,7 +138,7 @@ class EmailNotifier:
             # Create a secure SSL context
             context = ssl.create_default_context() if self.use_tls else None
             
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+            with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=10) as server:
                 if self.use_tls:
                     server.starttls(context=context)
                 

@@ -35,6 +35,7 @@ class Settings(BaseModel):
 
     # OpenAI
     openai_api_key: Optional[str] = Field(default_factory=lambda: os.environ.get("OPENAI_API_KEY"))
+    openai_api_base: Optional[str] = Field(default_factory=lambda: os.environ.get("OPENAI_API_BASE"))
 
     # DeepSeek
     deepseek_api_key: Optional[str] = Field(default_factory=lambda: os.environ.get("DEEPSEEK_API_KEY"))

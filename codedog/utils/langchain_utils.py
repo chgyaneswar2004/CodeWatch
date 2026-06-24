@@ -451,6 +451,7 @@ def load_gpt_llm() -> BaseChatModel:
     else:
         llm = ChatOpenAI(
             api_key=settings.openai_api_key,
+            base_url=settings.openai_api_base,
             model=gpt35_model,
             temperature=0,
         )
@@ -477,6 +478,7 @@ def load_gpt4_llm():
     else:
         llm = ChatOpenAI(
             api_key=settings.openai_api_key,
+            base_url=settings.openai_api_base,
             model=gpt4_model,
             temperature=0,
         )
@@ -503,6 +505,7 @@ def load_gpt4o_llm():
     else:
         llm = ChatOpenAI(
             api_key=settings.openai_api_key,
+            base_url=settings.openai_api_base,
             model=gpt4o_model,
             temperature=0,
         )
@@ -592,5 +595,14 @@ def load_model_by_name(model_name: str) -> BaseChatModel:
             logger.warning(f"Unrecognized GPT model name: {model_name}, defaulting to GPT-3.5")
             return load_gpt_llm()
 
-    # If we get here, the model name is not recognized
-    raise ValueError(f"Unknown model name: {model_name}. Available models: {list(model_loaders.keys())} or any OpenAI model name starting with 'gpt-'.")
+    # Try generic OpenAI compatible model loading for unrecognized model names (e.g. Nvidia/Groq models)
+    try:
+        logger.info(f"Initializing unrecognized model '{model_name}' as standard OpenAI-compatible ChatOpenAI model")
+        return ChatOpenAI(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_api_base,
+            model=model_name,
+            temperature=0,
+        )
+    except Exception as e:
+        raise ValueError(f"Unknown model name: {model_name} and failed to initialize standard ChatOpenAI: {e}")

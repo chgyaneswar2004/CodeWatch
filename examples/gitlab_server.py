@@ -22,6 +22,7 @@ from codedog.chains.code_review.base import CodeReviewChain
 from codedog.chains.pr_summary.base import PRSummaryChain
 from codedog.retrievers.gitlab_retriever import GitlabRetriever
 from codedog.utils.langchain_utils import load_model_by_name
+from codedog.utils.email_utils import send_report_email
 from codedog.version import VERSION
 from codedog.config.settings import settings
 
@@ -145,6 +146,23 @@ async def handle_event(retriever: GitlabRetriever, callback: Callable):
         )
         report = reporter.report()
         await asyncio.to_thread(callback, report)
+
+        # Send email report if configured
+        if settings.email_enabled and settings.notification_emails:
+            email_addresses = [email.strip() for email in settings.notification_emails.split(",") if email.strip()]
+            if email_addresses:
+                logging.info(f"Sending MR review report email to {', '.join(email_addresses)}")
+                subject = f"[CodeDog Webhook] MR #{retriever.pull_request.iid} Review: {retriever.pull_request.title}"
+                try:
+                    await asyncio.to_thread(
+                        send_report_email,
+                        to_emails=email_addresses,
+                        subject=subject,
+                        markdown_content=report,
+                    )
+                    logging.info("MR review report email sent successfully.")
+                except Exception as e:
+                    logging.error(f"Failed to send MR review report email: {e}")
 
 
 def start():

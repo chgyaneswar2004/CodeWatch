@@ -20,6 +20,7 @@ from codedog.chains.code_review.base import CodeReviewChain
 from codedog.chains.pr_summary.base import PRSummaryChain
 from codedog.retrievers.github_retriever import GithubRetriever
 from codedog.utils.langchain_utils import load_model_by_name
+from codedog.utils.email_utils import send_report_email
 from codedog.version import VERSION
 from codedog.config.settings import settings
 
@@ -132,6 +133,23 @@ async def handle_pull_request(
             print(report)
         else:
             await asyncio.to_thread(retriever._git_pull_request.create_issue_comment, report)
+
+        # Send email report if configured
+        if settings.email_enabled and settings.notification_emails:
+            email_addresses = [email.strip() for email in settings.notification_emails.split(",") if email.strip()]
+            if email_addresses:
+                logging.info(f"Sending PR review report email to {', '.join(email_addresses)}")
+                subject = f"[CodeDog Webhook] PR #{pull_request_number} Review: {retriever.pull_request.title}"
+                try:
+                    await asyncio.to_thread(
+                        send_report_email,
+                        to_emails=email_addresses,
+                        subject=subject,
+                        markdown_content=report,
+                    )
+                    logging.info("PR review report email sent successfully.")
+                except Exception as e:
+                    logging.error(f"Failed to send PR review report email: {e}")
 
 
 def _github_event_filter(event: GithubEvent):

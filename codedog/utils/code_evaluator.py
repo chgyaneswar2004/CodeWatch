@@ -2780,24 +2780,49 @@ Please format your response as JSON with the following fields:
 
         # Evaluate each file
         logger.info(f"Starting file-by-file evaluation for commit {commit_hash}")
-        for i, (file_path, diff_info) in enumerate(commit_diff.items()):
-            logger.info(f"Evaluating file {i+1}/{len(commit_diff)}: {file_path}")
+        
+        async def evaluate_single_file(file_path: str, diff_info: Dict[str, Any], index: int) -> Dict[str, Any]:
+            logger.info(f"Evaluating file {index+1}/{len(commit_diff)}: {file_path}")
             logger.debug(f"File info: status={diff_info['status']}, additions={diff_info.get('additions', 0)}, deletions={diff_info.get('deletions', 0)}")
-
-            # Use the new method for commit file evaluation
             start_time = time.time()
-            file_evaluation = await self.evaluate_commit_file(
-                file_path,
-                diff_info["diff"],
-                diff_info["status"],
-                diff_info.get("additions", 0),
-                diff_info.get("deletions", 0),
-            )
-            end_time = time.time()
-            logger.info(f"File {file_path} evaluated in {end_time - start_time:.2f} seconds with score: {file_evaluation.get('overall_score', 'N/A')}")
+            try:
+                file_evaluation = await self.evaluate_commit_file(
+                    file_path,
+                    diff_info["diff"],
+                    diff_info["status"],
+                    diff_info.get("additions", 0),
+                    diff_info.get("deletions", 0),
+                )
+                end_time = time.time()
+                logger.info(f"File {file_path} evaluated in {end_time - start_time:.2f} seconds with score: {file_evaluation.get('overall_score', 'N/A')}")
+                return file_evaluation
+            except Exception as e:
+                logger.error(f"Error evaluating file {file_path}: {e}", exc_info=True)
+                # Return a default/fallback evaluation result for this file so it doesn't crash the whole commit evaluation
+                return {
+                    "path": file_path,
+                    "status": diff_info["status"],
+                    "additions": diff_info.get("additions", 0),
+                    "deletions": diff_info.get("deletions", 0),
+                    "readability": 5,
+                    "efficiency": 5,
+                    "security": 5,
+                    "structure": 5,
+                    "error_handling": 5,
+                    "documentation": 5,
+                    "code_style": 5,
+                    "overall_score": 5,
+                    "summary": f"Failed to evaluate file due to error: {str(e)}",
+                    "comments": f"Error during evaluation: {str(e)}"
+                }
 
-            evaluation_results["files"].append(file_evaluation)
-            logger.debug(f"Added evaluation for {file_path} to results")
+        tasks = [
+            evaluate_single_file(file_path, diff_info, idx)
+            for idx, (file_path, diff_info) in enumerate(commit_diff.items())
+        ]
+        
+        file_evaluations = await asyncio.gather(*tasks)
+        evaluation_results["files"].extend(file_evaluations)
 
         # Evaluate the entire commit as a whole to get estimated working hours
         logger.info("Evaluating entire commit as a whole")

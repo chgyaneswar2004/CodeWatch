@@ -13,6 +13,7 @@ from codedog.chains.pr_summary.base import PRSummaryChain
 from codedog.chains.pr_summary.prompts import CODE_SUMMARY_PROMPT, PR_SUMMARY_PROMPT
 from codedog.chains.prompts import TRANSLATE_PROMPT
 from codedog.models import ChangeSummary, PRSummary
+from langchain.output_parsers import OutputFixingParser, PydanticOutputParser
 
 
 class TranslatePRSummaryChain(PRSummaryChain):

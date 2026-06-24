@@ -5,7 +5,6 @@ demo github api server
 import asyncio
 import logging
 import time
-import os
 import hmac
 import hashlib
 
@@ -180,4 +179,3 @@ def start():
 
 if __name__ == "__main__":
     start()
-

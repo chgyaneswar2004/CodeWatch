@@ -2113,9 +2113,8 @@ class DiffEvaluator:
         # 如果文件可能超过模型的上下文限制，则分块处理
         if estimated_tokens > 12000:  # 留出一些空间给系统提示和其他内容
             logger.info(f"文件 {file_path} 过大（估计 {estimated_tokens:.0f} 令牌），将进行分块处理")
-            print(f"ℹ️ File too large, will be processed in {len(chunks)} chunks")
-
             chunks = self._split_diff_content(file_diff, file_path)
+            print(f"ℹ️ File too large, will be processed in {len(chunks)} chunks")
 
             # 分别评估每个块
             chunk_results = []
@@ -2446,13 +2445,14 @@ class DiffEvaluator:
 
                 commit, file_path = task_metadata[task_idx]
 
-                # 检查是否发生异常
-                if isinstance(eval_result, Exception):
-                    logger.error(f"Error evaluating file {file_path}: {str(eval_result)}")
-                    print(f"⚠️ Error evaluating file {file_path}: {str(eval_result)}")
+                # 检查是否发生异常或返回格式不正确
+                if isinstance(eval_result, (Exception, BaseException)) or not isinstance(eval_result, dict):
+                    error_msg = str(eval_result) if isinstance(eval_result, BaseException) else "Invalid response format"
+                    logger.error(f"Error evaluating file {file_path}: {error_msg}")
+                    print(f"⚠️ Error evaluating file {file_path}: {error_msg}")
 
                     # 创建默认评估结果
-                    default_scores = self._generate_default_scores(f"评估失败: {str(eval_result)}")
+                    default_scores = self._generate_default_scores(f"评估失败: {error_msg}")
                     results.append(
                         FileEvaluationResult(
                             file_path=file_path,
@@ -2780,10 +2780,16 @@ Please format your response as JSON with the following fields:
 
         # Evaluate each file
         logger.info(f"Starting file-by-file evaluation for commit {commit_hash}")
-        
+
         async def evaluate_single_file(file_path: str, diff_info: Dict[str, Any], index: int) -> Dict[str, Any]:
-            logger.info(f"Evaluating file {index+1}/{len(commit_diff)}: {file_path}")
-            logger.debug(f"File info: status={diff_info['status']}, additions={diff_info.get('additions', 0)}, deletions={diff_info.get('deletions', 0)}")
+            logger.info(
+                f"Evaluating file {index+1}/{len(commit_diff)}: {file_path}"
+            )
+            logger.debug(
+                f"File info: status={diff_info['status']}, "
+                f"additions={diff_info.get('additions', 0)}, "
+                f"deletions={diff_info.get('deletions', 0)}"
+            )
             start_time = time.time()
             try:
                 file_evaluation = await self.evaluate_commit_file(
@@ -2794,11 +2800,16 @@ Please format your response as JSON with the following fields:
                     diff_info.get("deletions", 0),
                 )
                 end_time = time.time()
-                logger.info(f"File {file_path} evaluated in {end_time - start_time:.2f} seconds with score: {file_evaluation.get('overall_score', 'N/A')}")
+                logger.info(
+                    f"File {file_path} evaluated in "
+                    f"{end_time - start_time:.2f} seconds with score: "
+                    f"{file_evaluation.get('overall_score', 'N/A')}"
+                )
                 return file_evaluation
             except Exception as e:
                 logger.error(f"Error evaluating file {file_path}: {e}", exc_info=True)
-                # Return a default/fallback evaluation result for this file so it doesn't crash the whole commit evaluation
+                # Return a default/fallback evaluation result for this file
+                # so it doesn't crash the whole commit evaluation
                 return {
                     "path": file_path,
                     "status": diff_info["status"],
@@ -2820,7 +2831,7 @@ Please format your response as JSON with the following fields:
             evaluate_single_file(file_path, diff_info, idx)
             for idx, (file_path, diff_info) in enumerate(commit_diff.items())
         ]
-        
+
         file_evaluations = await asyncio.gather(*tasks)
         evaluation_results["files"].extend(file_evaluations)
 

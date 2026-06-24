@@ -186,10 +186,13 @@ class TestLangchainUtils(unittest.TestCase):
 
             # Mock context manager protocol
             mock_context = MagicMock()
+
             async def mock_aenter(*args, **kwargs):
                 return mock_response
+
             async def mock_aexit(*args, **kwargs):
                 pass
+
             mock_context.__aenter__ = mock_aenter
             mock_context.__aexit__ = mock_aexit
             mock_post.return_value = mock_context

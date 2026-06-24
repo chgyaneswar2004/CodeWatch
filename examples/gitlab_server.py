@@ -5,7 +5,6 @@ demo gitlab api server
 import asyncio
 import logging
 import time
-import os
 import traceback
 from typing import Callable
 
@@ -172,4 +171,3 @@ def start():
 
 if __name__ == "__main__":
     start()
-

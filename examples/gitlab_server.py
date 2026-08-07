@@ -4,13 +4,12 @@ demo gitlab api server
 
 import asyncio
 import logging
-import threading
 import time
 import traceback
 from typing import Callable
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from gitlab import Gitlab
 from gitlab.v4.objects import ProjectMergeRequest
@@ -21,15 +20,18 @@ from codedog.actors.reporters.pull_request import PullRequestReporter
 from codedog.chains.code_review.base import CodeReviewChain
 from codedog.chains.pr_summary.base import PRSummaryChain
 from codedog.retrievers.gitlab_retriever import GitlabRetriever
-from codedog.utils.langchain_utils import load_gpt4_llm, load_gpt_llm
+from codedog.utils.langchain_utils import load_model_by_name
+from codedog.utils.email_utils import send_report_email
 from codedog.version import VERSION
+from codedog.config.settings import settings
 
 # config
 host = "127.0.0.1"
 port = 32167
 worker_num = 1
-gitlab_token = "your gitlab token here"
-gitlab_base_url = "your gitlab base url here"
+gitlab_token = settings.gitlab_token or "your gitlab token here"
+gitlab_base_url = settings.gitlab_url or "your gitlab base url here"
+gitlab_webhook_token = settings.gitlab_webhook_token
 
 # fastapi
 app = FastAPI()
@@ -42,76 +44,68 @@ class GitlabEvent(BaseModel):
 
 
 @app.post("/gitlab_event", response_class=PlainTextResponse)
-async def gitlab_event(event: GitlabEvent) -> str:
+async def gitlab_event(event: GitlabEvent, x_gitlab_token: str = Header(None)) -> str:
     """Gitlab webhook."""
+    if gitlab_webhook_token:
+        if not x_gitlab_token or x_gitlab_token != gitlab_webhook_token:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-Gitlab-Token")
+    else:
+        logging.warning("GitLab webhook token verification is disabled (GITLAB_WEBHOOK_TOKEN is not set)")
+
     t = time.time()
-    status = "failed"
+    status = "success"
 
     try:
-        message = handle_gitlab_event(event)
-        status = "success"
+        message = await handle_gitlab_event(event)
     except Exception:
-        logging.warn(
+        logging.warning(
             "Fail to handle gitlab event: %s",
             traceback.format_exc().replace("\n", "\\n"),
         )
-        message = "failed"
-    finally:
-        logging.info(
-            "Submit github pull request review: %s:#%d-%s Start: %f Status: %s",
-            event.project.get("name"),
-            event.object_attributes.get("iid"),
-            event.object_attributes.get("title"),
-            t,
-            time.time() - t,
-            status,
-        )
+        message = "fail to handle event"
+        status = "failed"
 
+    logging.info(
+        "Handle gitlab event kind: %s, duration: %f, status: %s",
+        event.object_kind,
+        time.time() - t,
+        status,
+    )
     return message
 
 
-def handle_gitlab_event(event: GitlabEvent) -> str:
+async def handle_gitlab_event(event: GitlabEvent) -> str:
     """Trigger merge request review based on gitlab event."""
     if not _validate_event(event):
         raise ValueError("Invalid Event.")
 
-    project_id: int = event.project.get("id", 0)
-    merge_request_iid: int = event.object_attributes.get("iid", 0)
-    client = Gitlab(url=gitlab_base_url, private_token=gitlab_token)
+    project_id = event.project["id"]
+    merge_request_iid = event.object_attributes["iid"]
+
+    logging.info("Start review merge request %s %d", project_id, merge_request_iid)
+
     retriever = GitlabRetriever(
-        client=client,
+        client=Gitlab(gitlab_base_url, private_token=gitlab_token),
         project_name_or_id=project_id,
         merge_request_iid=merge_request_iid,
     )
     callback = _comment_callback(retriever._git_merge_request)
 
-    thread = threading.Thread(
-        target=asyncio.run, args=(handle_event(retriever, callback=callback),)
-    )
-    thread.start()
+    asyncio.create_task(handle_event(retriever, callback=callback))
     return "Review Request Submitted."
 
 
 def _validate_event(event: GitlabEvent) -> bool:
-    """Merge request open/reopen event with no draft mark will return True, otherwise False."""
-    object_attributes = event.object_attributes
-
     if event.object_kind != "merge_request":
         return False
-
-    if object_attributes.get("action") not in ("open", "reopen"):
+    # trigger review when PR is opened or new commit is pushed (update action)
+    action = event.object_attributes.get("action")
+    if action not in ["open", "update"]:
         return False
-
-    if object_attributes.get("state", "") != "opened":
-        return False
-
-    if object_attributes.get("work_in_progress", False):
-        return False
-
     return True
 
 
-def _comment_callback(merge_request: ProjectMergeRequest):
+def _comment_callback(merge_request: ProjectMergeRequest) -> Callable[[str], None]:
     """Build callback function for merge request comment."""
 
     def callback(report: str):
@@ -129,13 +123,14 @@ def _comment_callback(merge_request: ProjectMergeRequest):
 async def handle_event(retriever: GitlabRetriever, callback: Callable):
     t = time.time()
     summary_chain = PRSummaryChain.from_llm(
-        code_summary_llm=load_gpt_llm(), pr_summary_llm=load_gpt4_llm()
+        code_summary_llm=load_model_by_name(settings.code_summary_model),
+        pr_summary_llm=load_model_by_name(settings.pr_summary_model)
     )
-    review_chain = CodeReviewChain.from_llm(llm=load_gpt_llm())
+    review_chain = CodeReviewChain.from_llm(llm=load_model_by_name(settings.code_review_model))
 
     with get_openai_callback() as cb:
-        summary_result = summary_chain({"pull_request": retriever.pull_request})
-        review_result = review_chain({"pull_request": retriever.pull_request})
+        summary_result = await summary_chain.ainvoke({"pull_request": retriever.pull_request})
+        review_result = await review_chain.ainvoke({"pull_request": retriever.pull_request})
         reporter = PullRequestReporter(
             pr_summary=summary_result["pr_summary"],
             code_summaries=summary_result["code_summaries"],
@@ -149,7 +144,24 @@ async def handle_event(retriever: GitlabRetriever, callback: Callable):
             },
         )
         report = reporter.report()
-        callback(report)
+        await asyncio.to_thread(callback, report)
+
+        # Send email report if configured
+        if settings.email_enabled and settings.notification_emails:
+            email_addresses = [email.strip() for email in settings.notification_emails.split(",") if email.strip()]
+            if email_addresses:
+                logging.info(f"Sending MR review report email to {', '.join(email_addresses)}")
+                subject = f"[CodeDog Webhook] MR #{retriever.pull_request.iid} Review: {retriever.pull_request.title}"
+                try:
+                    await asyncio.to_thread(
+                        send_report_email,
+                        to_emails=email_addresses,
+                        subject=subject,
+                        markdown_content=report,
+                    )
+                    logging.info("MR review report email sent successfully.")
+                except Exception as e:
+                    logging.error(f"Failed to send MR review report email: {e}")
 
 
 def start():

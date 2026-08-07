@@ -8,11 +8,11 @@ from langchain_core.callbacks.manager import (
     AsyncCallbackManagerForChainRun,
     CallbackManagerForChainRun,
 )
-from langchain.chains import LLMChain
 from langchain.chains.base import Chain
 from langchain.output_parsers import OutputFixingParser, PydanticOutputParser
-from langchain_core.output_parsers import BaseOutputParser
+from langchain_core.output_parsers import BaseOutputParser, StrOutputParser
 from langchain_core.prompts import BasePromptTemplate
+from langchain_core.runnables import RunnableLambda
 from pydantic import Field, BaseModel, ConfigDict
 
 from codedog.chains.pr_summary.prompts import CODE_SUMMARY_PROMPT, PR_SUMMARY_PROMPT
@@ -36,9 +36,9 @@ class PRSummaryChain(Chain):
     - code_summaries(Dict[str, str]): changed code file summarizations, key is file path.
     """
 
-    code_summary_chain: LLMChain = Field(exclude=True)
+    code_summary_chain: Any = Field(exclude=True)
     """Chain to use to summarize code change."""
-    pr_summary_chain: LLMChain = Field(exclude=True)
+    pr_summary_chain: Any = Field(exclude=True)
     """Chain to use to summarize PR."""
 
     parser: BaseOutputParser = Field(exclude=True)
@@ -74,8 +74,8 @@ class PRSummaryChain(Chain):
 
         code_summary_inputs = self._process_code_summary_inputs(pr)
         code_summary_outputs = (
-            self.code_summary_chain.apply(
-                code_summary_inputs, callbacks=_run_manager.get_child(tag="CodeSummary")
+            self.code_summary_chain.batch(
+                code_summary_inputs, config={"callbacks": _run_manager.get_child(tag="CodeSummary")}
             )
             if code_summary_inputs
             else []
@@ -86,8 +86,8 @@ class PRSummaryChain(Chain):
         )
 
         pr_summary_input = self._process_pr_summary_input(pr, code_summaries)
-        pr_summary_output = self.pr_summary_chain(
-            pr_summary_input, callbacks=_run_manager.get_child(tag="PRSummary")
+        pr_summary_output = self.pr_summary_chain.invoke(
+            pr_summary_input, config={"callbacks": _run_manager.get_child(tag="PRSummary")}
         )
 
         return self._process_result(pr_summary_output, code_summaries)
@@ -97,8 +97,8 @@ class PRSummaryChain(Chain):
 
         code_summary_inputs = self._process_code_summary_inputs(pr)
         code_summary_outputs = (
-            await self.code_summary_chain.aapply(
-                code_summary_inputs, callbacks=_run_manager.get_child()
+            await self.code_summary_chain.abatch(
+                code_summary_inputs, config={"callbacks": _run_manager.get_child()}
             )
             if code_summary_inputs
             else []
@@ -110,7 +110,7 @@ class PRSummaryChain(Chain):
 
         pr_summary_input = self._process_pr_summary_input(pr, code_summaries)
         pr_summary_output = await self.pr_summary_chain.ainvoke(
-            pr_summary_input, callbacks=_run_manager.get_child()
+            pr_summary_input, config={"callbacks": _run_manager.get_child()}
         )
 
         return await self._aprocess_result(pr_summary_output, code_summaries)
@@ -167,18 +167,30 @@ class PRSummaryChain(Chain):
     def _process_result(
         self, pr_summary_output: Dict[str, Any], code_summaries: List[ChangeSummary]
     ) -> Dict[str, Any]:
+        summary = pr_summary_output.get("text")
+        if isinstance(summary, str):
+            try:
+                summary = self.parser.parse(summary)
+            except Exception as e:
+                logging.error(f"Failed to parse PR summary: {e}. Falling back to default PRSummary.")
+                summary = PRSummary(overview=summary)
         return {
-            "pr_summary": pr_summary_output["text"],
+            "pr_summary": summary,
             "code_summaries": code_summaries,
         }
 
     async def _aprocess_result(
         self, pr_summary_output: Dict[str, Any], code_summaries: List[ChangeSummary]
     ) -> Dict[str, Any]:
-        raw_output_text = pr_summary_output.get("text", "[No text found in output]")
-        logging.warning(f"Raw LLM output for PR Summary: {raw_output_text}")
+        summary = pr_summary_output.get("text")
+        if isinstance(summary, str):
+            try:
+                summary = self.parser.parse(summary)
+            except Exception as e:
+                logging.error(f"Failed to parse PR summary: {e}. Falling back to default PRSummary.")
+                summary = PRSummary(overview=summary)
         return {
-            "pr_summary": raw_output_text,
+            "pr_summary": summary,
             "code_summaries": code_summaries,
         }
 
@@ -194,9 +206,17 @@ class PRSummaryChain(Chain):
         parser = OutputFixingParser.from_llm(
             llm=pr_summary_llm, parser=PydanticOutputParser(pydantic_object=PRSummary)
         )
-        code_summary_chain = LLMChain(llm=code_summary_llm, prompt=code_summary_prompt)
-        pr_summary_chain = LLMChain(
-            llm=pr_summary_llm, prompt=pr_summary_prompt, output_parser=parser
+        code_summary_chain = (
+            code_summary_prompt
+            | code_summary_llm
+            | StrOutputParser()
+            | RunnableLambda(lambda x: {"text": x})
+        )
+        pr_summary_chain = (
+            pr_summary_prompt
+            | pr_summary_llm
+            | parser
+            | RunnableLambda(lambda x: {"text": x})
         )
         return cls(
             code_summary_chain=code_summary_chain,

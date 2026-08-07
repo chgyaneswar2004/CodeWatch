@@ -9,21 +9,12 @@ from codedog.models import ChangeFile, ChangeStatus, ChangeSummary, PullRequest
 
 CONTENT_CHANGE_STATUS = [ChangeStatus.addition, ChangeStatus.modified]
 
-SUPPORT_CODE_FILE_SUFFIX = set(["py", "java", "go", "js", "ts", "php", "c", "cpp", "h", "cs", "rs"])
+from codedog.config.settings import settings
 
-SUFFIX_LANGUAGE_MAPPING = {
-    "py": "python",
-    "java": "java",
-    "go": "go",
-    "js": "javascript",
-    "ts": "typescript",
-    "php": "php",
-    "c": "c",
-    "cpp": "cpp",
-    "h": "c",
-    "cs": "csharp",
-    "rs": "rust",
-}
+SUPPORT_CODE_FILE_SUFFIX = settings.support_code_file_suffix_set
+SUFFIX_LANGUAGE_MAPPING = settings.suffix_language_mapping_dict
+
+
 
 
 class PullRequestProcessor(Localization):

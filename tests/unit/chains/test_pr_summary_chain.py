@@ -20,7 +20,8 @@ class TestPRSummaryChain(unittest.TestCase):
         self.mock_code_summary_outputs = [
             {"text": "File 1 summary"}
         ]
-        self.mock_code_summary_chain.apply.return_value = self.mock_code_summary_outputs
+        self.mock_code_summary_chain.batch.return_value = self.mock_code_summary_outputs
+        self.mock_code_summary_chain.abatch.return_value = self.mock_code_summary_outputs
 
         self.mock_pr_summary = PRSummary(
             overview="PR overview",
@@ -31,7 +32,8 @@ class TestPRSummaryChain(unittest.TestCase):
         self.mock_pr_summary_output = {
             "text": self.mock_pr_summary
         }
-        self.mock_pr_summary_chain.return_value = self.mock_pr_summary_output
+        self.mock_pr_summary_chain.invoke.return_value = self.mock_pr_summary_output
+        self.mock_pr_summary_chain.ainvoke.return_value = self.mock_pr_summary_output
 
         # Create a real parser instead of a MagicMock
         class TestParser(BaseOutputParser):
@@ -86,10 +88,10 @@ class TestPRSummaryChain(unittest.TestCase):
         result = self.chain._call({"pull_request": self.mock_pr}, mock_run_manager)
 
         # Verify code summary chain was called
-        self.mock_code_summary_chain.apply.assert_called_once()
+        self.mock_code_summary_chain.batch.assert_called_once()
 
         # Verify PR summary chain was called
-        self.mock_pr_summary_chain.assert_called_once()
+        self.mock_pr_summary_chain.invoke.assert_called_once()
 
         # Verify result structure
         self.assertIn("pr_summary", result)

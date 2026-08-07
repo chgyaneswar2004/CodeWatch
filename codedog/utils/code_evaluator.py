@@ -2113,9 +2113,8 @@ class DiffEvaluator:
         # 如果文件可能超过模型的上下文限制，则分块处理
         if estimated_tokens > 12000:  # 留出一些空间给系统提示和其他内容
             logger.info(f"文件 {file_path} 过大（估计 {estimated_tokens:.0f} 令牌），将进行分块处理")
-            print(f"ℹ️ File too large, will be processed in {len(chunks)} chunks")
-
             chunks = self._split_diff_content(file_diff, file_path)
+            print(f"ℹ️ File too large, will be processed in {len(chunks)} chunks")
 
             # 分别评估每个块
             chunk_results = []
@@ -2446,13 +2445,14 @@ class DiffEvaluator:
 
                 commit, file_path = task_metadata[task_idx]
 
-                # 检查是否发生异常
-                if isinstance(eval_result, Exception):
-                    logger.error(f"Error evaluating file {file_path}: {str(eval_result)}")
-                    print(f"⚠️ Error evaluating file {file_path}: {str(eval_result)}")
+                # 检查是否发生异常或返回格式不正确
+                if isinstance(eval_result, (Exception, BaseException)) or not isinstance(eval_result, dict):
+                    error_msg = str(eval_result) if isinstance(eval_result, BaseException) else "Invalid response format"
+                    logger.error(f"Error evaluating file {file_path}: {error_msg}")
+                    print(f"⚠️ Error evaluating file {file_path}: {error_msg}")
 
                     # 创建默认评估结果
-                    default_scores = self._generate_default_scores(f"评估失败: {str(eval_result)}")
+                    default_scores = self._generate_default_scores(f"评估失败: {error_msg}")
                     results.append(
                         FileEvaluationResult(
                             file_path=file_path,
@@ -2780,24 +2780,60 @@ Please format your response as JSON with the following fields:
 
         # Evaluate each file
         logger.info(f"Starting file-by-file evaluation for commit {commit_hash}")
-        for i, (file_path, diff_info) in enumerate(commit_diff.items()):
-            logger.info(f"Evaluating file {i+1}/{len(commit_diff)}: {file_path}")
-            logger.debug(f"File info: status={diff_info['status']}, additions={diff_info.get('additions', 0)}, deletions={diff_info.get('deletions', 0)}")
 
-            # Use the new method for commit file evaluation
-            start_time = time.time()
-            file_evaluation = await self.evaluate_commit_file(
-                file_path,
-                diff_info["diff"],
-                diff_info["status"],
-                diff_info.get("additions", 0),
-                diff_info.get("deletions", 0),
+        async def evaluate_single_file(file_path: str, diff_info: Dict[str, Any], index: int) -> Dict[str, Any]:
+            logger.info(
+                f"Evaluating file {index+1}/{len(commit_diff)}: {file_path}"
             )
-            end_time = time.time()
-            logger.info(f"File {file_path} evaluated in {end_time - start_time:.2f} seconds with score: {file_evaluation.get('overall_score', 'N/A')}")
+            logger.debug(
+                f"File info: status={diff_info['status']}, "
+                f"additions={diff_info.get('additions', 0)}, "
+                f"deletions={diff_info.get('deletions', 0)}"
+            )
+            start_time = time.time()
+            try:
+                file_evaluation = await self.evaluate_commit_file(
+                    file_path,
+                    diff_info["diff"],
+                    diff_info["status"],
+                    diff_info.get("additions", 0),
+                    diff_info.get("deletions", 0),
+                )
+                end_time = time.time()
+                logger.info(
+                    f"File {file_path} evaluated in "
+                    f"{end_time - start_time:.2f} seconds with score: "
+                    f"{file_evaluation.get('overall_score', 'N/A')}"
+                )
+                return file_evaluation
+            except Exception as e:
+                logger.error(f"Error evaluating file {file_path}: {e}", exc_info=True)
+                # Return a default/fallback evaluation result for this file
+                # so it doesn't crash the whole commit evaluation
+                return {
+                    "path": file_path,
+                    "status": diff_info["status"],
+                    "additions": diff_info.get("additions", 0),
+                    "deletions": diff_info.get("deletions", 0),
+                    "readability": 5,
+                    "efficiency": 5,
+                    "security": 5,
+                    "structure": 5,
+                    "error_handling": 5,
+                    "documentation": 5,
+                    "code_style": 5,
+                    "overall_score": 5,
+                    "summary": f"Failed to evaluate file due to error: {str(e)}",
+                    "comments": f"Error during evaluation: {str(e)}"
+                }
 
-            evaluation_results["files"].append(file_evaluation)
-            logger.debug(f"Added evaluation for {file_path} to results")
+        tasks = [
+            evaluate_single_file(file_path, diff_info, idx)
+            for idx, (file_path, diff_info) in enumerate(commit_diff.items())
+        ]
+
+        file_evaluations = await asyncio.gather(*tasks)
+        evaluation_results["files"].extend(file_evaluations)
 
         # Evaluate the entire commit as a whole to get estimated working hours
         logger.info("Evaluating entire commit as a whole")
@@ -2886,18 +2922,89 @@ Please provide a brief summary of the overall changes and their impact.
 If estimated working hours are provided, please comment on whether this estimate seems reasonable given the scope of changes."""
 
 
-def generate_evaluation_markdown(evaluation_results: List[FileEvaluationResult]) -> str:
+def generate_commit_report_markdown(review_results: Dict[str, Any]) -> str:
+    """Generate Markdown report for a single commit review."""
+    commit_hash = review_results.get("commit_hash", "Unknown")
+    stats = review_results.get("statistics", {})
+    whole_eval = review_results.get("whole_commit_evaluation", {})
+    files = review_results.get("files", [])
+
+    markdown = f"# CodeDog Commit Review Report - {commit_hash[:8]}\n\n"
+
+    markdown += "## Overview\n\n"
+    markdown += f"- **Commit Hash**: {commit_hash}\n"
+    markdown += f"- **Files Evaluated**: {stats.get('total_files', 0)}\n"
+    markdown += f"- **Total Additions**: {stats.get('total_additions', 0)} lines\n"
+    markdown += f"- **Total Deletions**: {stats.get('total_deletions', 0)} lines\n"
+
+    est_hours = review_results.get("estimated_hours", 0)
+    if est_hours > 0:
+        markdown += f"- **Estimated Working Hours**: {est_hours:.1f} hours\n"
+
+    markdown += "\n"
+
+    # Overall score table
+    markdown += "## Overall Scores\n\n"
+    markdown += "| Dimension | Score |\n"
+    markdown += "|-----------|-------|\n"
+    markdown += f"| Readability | {whole_eval.get('readability', 5)} |\n"
+    markdown += f"| Efficiency & Performance | {whole_eval.get('efficiency', 5)} |\n"
+    markdown += f"| Security | {whole_eval.get('security', 5)} |\n"
+    markdown += f"| Structure & Design | {whole_eval.get('structure', 5)} |\n"
+    markdown += f"| Error Handling | {whole_eval.get('error_handling', 5)} |\n"
+    markdown += f"| Documentation & Comments | {whole_eval.get('documentation', 5)} |\n"
+    markdown += f"| Code Style | {whole_eval.get('code_style', 5)} |\n"
+
+    overall_score = whole_eval.get('overall_score', 5.0)
+    if isinstance(overall_score, (int, float)):
+        markdown += f"| **Overall Score** | **{overall_score:.1f}** |\n"
+    else:
+        markdown += f"| **Overall Score** | **{overall_score}** |\n"
+
+    markdown += "\n"
+
+    # Overall summary comments
+    markdown += "## Overall Summary & Impact\n\n"
+    markdown += f"{review_results.get('summary', 'No summary available.')}\n\n"
+
+    # Detail comments
+    markdown += "## File Evaluation Details\n\n"
+    for idx, file in enumerate(files, 1):
+        markdown += f"### {idx}. {file.get('path', 'Unknown')}\n\n"
+        markdown += f"- **Status**: {file.get('status', 'M')}\n"
+        markdown += f"- **Overall Score**: {file.get('overall_score', 5.0)}\n"
+        markdown += f"- **Scores**:\n\n"
+        markdown += "| Dimension | Score |\n"
+        markdown += "|-----------|-------|\n"
+        markdown += f"| Readability | {file.get('readability', 5)} |\n"
+        markdown += f"| Efficiency | {file.get('efficiency', 5)} |\n"
+        markdown += f"| Security | {file.get('security', 5)} |\n"
+        markdown += f"| Structure | {file.get('structure', 5)} |\n"
+        markdown += f"| Error Handling | {file.get('error_handling', 5)} |\n"
+        markdown += f"| Documentation | {file.get('documentation', 5)} |\n"
+        markdown += f"| Code Style | {file.get('code_style', 5)} |\n\n"
+        markdown += "**Comments**:\n\n"
+        markdown += f"{file.get('comments', 'No comments available.')}\n\n"
+        markdown += "---\n\n"
+
+    return markdown
+
+
+def generate_evaluation_markdown(evaluation_results) -> str:
     """
     生成评价结果的Markdown表格
 
     Args:
-        evaluation_results: 文件评价结果列表
+        evaluation_results: 文件评价结果列表(List[FileEvaluationResult]) 或 单个提交的评价结果字典(Dict[str, Any])
 
     Returns:
         str: Markdown格式的评价表格
     """
     if not evaluation_results:
         return "## 代码评价结果\n\n没有找到需要评价的代码提交。"
+
+    if isinstance(evaluation_results, dict):
+        return generate_commit_report_markdown(evaluation_results)
 
     # 按日期排序结果
     sorted_results = sorted(evaluation_results, key=lambda x: x.date)

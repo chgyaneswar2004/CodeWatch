@@ -8,9 +8,10 @@ from langchain_core.callbacks.manager import (
     AsyncCallbackManagerForChainRun,
     CallbackManagerForChainRun,
 )
-from langchain.chains import LLMChain
 from langchain.chains.base import Chain
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import BasePromptTemplate
+from langchain_core.runnables import RunnableLambda
 from pydantic import Field
 
 from codedog.chains.code_review.prompts import CODE_REVIEW_PROMPT
@@ -20,7 +21,7 @@ from codedog.processors.pull_request_processor import SUFFIX_LANGUAGE_MAPPING
 
 
 class CodeReviewChain(Chain):
-    chain: LLMChain = Field(exclude=True)
+    chain: Any = Field(exclude=True)
     """Chain to use to review code change."""
     processor: PullRequestProcessor = Field(
         exclude=True, default_factory=PullRequestProcessor.build
@@ -62,8 +63,8 @@ class CodeReviewChain(Chain):
 
         code_review_inputs = self._process_code_review_inputs(code_files)
         code_review_outputs = (
-            self.chain.apply(
-                code_review_inputs, callbacks=_run_manager.get_child(tag="CodeReview")
+            self.chain.batch(
+                code_review_inputs, config={"callbacks": _run_manager.get_child(tag="CodeReview")}
             )
             if code_review_inputs
             else []
@@ -84,8 +85,8 @@ class CodeReviewChain(Chain):
 
         code_review_inputs = self._process_code_review_inputs(code_files)
         code_review_outputs = (
-            await self.chain.aapply(
-                code_review_inputs, callbacks=_run_manager.get_child(tag="CodeReview")
+            await self.chain.abatch(
+                code_review_inputs, config={"callbacks": _run_manager.get_child(tag="CodeReview")}
             )
             if code_review_inputs
             else []
@@ -132,7 +133,8 @@ class CodeReviewChain(Chain):
         prompt: BasePromptTemplate = CODE_REVIEW_PROMPT,
         **kwargs,
     ) -> CodeReviewChain:
+        chain = prompt | llm | StrOutputParser() | RunnableLambda(lambda x: {"text": x})
         return cls(
-            chain=LLMChain(llm=llm, prompt=prompt, **kwargs),
+            chain=chain,
             processor=PullRequestProcessor(),
         )

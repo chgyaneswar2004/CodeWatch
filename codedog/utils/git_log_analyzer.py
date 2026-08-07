@@ -379,70 +379,111 @@ def get_commit_diff(
     if not os.path.exists(git_dir):
         raise ValueError(f"Not a git repository: {repo_path}")
 
-    # Get commit diff
-    cmd = ["git", "show", "--name-status", "--numstat", "--pretty=format:", commit_hash]
-    result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True)
+    # 1. Get the file stats (additions, deletions) via numstat
+    numstat_cmd = ["git", "show", "--numstat", "--pretty=format:", commit_hash]
+    numstat_result = subprocess.run(numstat_cmd, cwd=repo_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
-    if result.returncode != 0:
-        raise ValueError(f"Failed to get commit diff: {result.stderr}")
+    if numstat_result.returncode != 0:
+        raise ValueError(f"Failed to get commit numstat: {numstat_result.stderr}")
 
-    # Parse the diff output
+    stats_map = {}
+    for line in numstat_result.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            add_str, del_str, file_path = parts[0], parts[1], parts[2]
+            additions = int(add_str) if add_str.isdigit() else 0
+            deletions = int(del_str) if del_str.isdigit() else 0
+            stats_map[file_path] = {
+                "additions": additions,
+                "deletions": deletions,
+            }
+
+    # 2. Get the full diff content (patch text)
+    diff_cmd = ["git", "show", "--pretty=format:", commit_hash]
+    diff_result = subprocess.run(diff_cmd, cwd=repo_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    if diff_result.returncode != 0:
+        raise ValueError(f"Failed to get commit diff: {diff_result.stderr}")
+
     file_diffs = {}
     current_file = None
     current_diff = []
+    current_status = "M"
 
-    for line in result.stdout.splitlines():
-        if not line.strip():
-            continue
-
-        # Check if line starts with a file status (e.g., "M\tfile.py")
-        if line.startswith(("A\t", "M\t", "D\t")):
+    for line in diff_result.stdout.splitlines():
+        if line.startswith("diff --git"):
+            # Save the previous file's diff
             if current_file and current_diff:
                 file_diffs[current_file] = {
                     "diff": "\n".join(current_diff),
                     "status": current_status,
-                    "additions": current_additions,
-                    "deletions": current_deletions,
+                    "additions": stats_map.get(current_file, {}).get("additions", 0),
+                    "deletions": stats_map.get(current_file, {}).get("deletions", 0),
                 }
+            current_file = None
             current_diff = []
-            current_status = line[0]
-            current_file = line[2:]
-            current_additions = 0
-            current_deletions = 0
+            current_status = "M"
 
-        # Parse numstat line (e.g., "3\t2\tfile.py")
-        elif line[0].isdigit():
-            additions, deletions, filename = line.split("\t")
-            current_additions = int(additions)
-            current_deletions = int(deletions)
-
-        # Add to current diff
-        else:
+            match = re.match(r'^diff --git a/(.*) b/(.*)$', line)
+            if match:
+                current_file = match.group(2)
+            current_diff.append(line)
+        elif line.startswith("new file mode"):
+            current_status = "A"
+            current_diff.append(line)
+        elif line.startswith("deleted file mode"):
+            current_status = "D"
+            current_diff.append(line)
+        elif line.startswith("rename to "):
+            current_file = line[10:]
+            current_status = "R"
+            current_diff.append(line)
+        elif line.startswith("--- a/") or line.startswith("+++ b/"):
+            if not current_file:
+                if line.startswith("--- a/"):
+                    current_file = line[6:]
+                elif line.startswith("+++ b/"):
+                    current_file = line[6:]
+            current_diff.append(line)
+        elif current_file is not None:
             current_diff.append(line)
 
-    # Add the last file
+    # Save the last file
     if current_file and current_diff:
         file_diffs[current_file] = {
             "diff": "\n".join(current_diff),
             "status": current_status,
-            "additions": current_additions,
-            "deletions": current_deletions,
+            "additions": stats_map.get(current_file, {}).get("additions", 0),
+            "deletions": stats_map.get(current_file, {}).get("deletions", 0),
         }
+
+    # Fallback to compute additions/deletions if stats_map lookup fails
+    for file_path, data in file_diffs.items():
+        if data["additions"] == 0 and data["deletions"] == 0:
+            add = 0
+            sub = 0
+            for line in data["diff"].splitlines():
+                if line.startswith("+") and not line.startswith("+++"):
+                    add += 1
+                elif line.startswith("-") and not line.startswith("---"):
+                    sub += 1
+            data["additions"] = add
+            data["deletions"] = sub
 
     # Filter by file extensions
     if include_extensions or exclude_extensions:
         filtered_diffs = {}
         for file_path, diff in file_diffs.items():
             file_ext = os.path.splitext(file_path)[1].lower()
-            
-            # Skip if extension is in exclude list
+
             if exclude_extensions and file_ext in exclude_extensions:
                 continue
-                
-            # Include if extension is in include list or no include list specified
+
             if not include_extensions or file_ext in include_extensions:
                 filtered_diffs[file_path] = diff
-                
+
         file_diffs = filtered_diffs
 
     return file_diffs

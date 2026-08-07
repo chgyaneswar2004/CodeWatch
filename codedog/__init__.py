@@ -113,5 +113,7 @@ from codedog.actors.reporters.pull_request import PullRequestReporter
 from codedog.chains.code_review.base import CodeReviewChain
 from codedog.chains.pr_summary.base import PRSummaryChain
 from codedog.version import VERSION
+from codedog.config.settings import settings
 
 __version__ = VERSION
+
